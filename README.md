@@ -2,6 +2,8 @@
 
 > Um leitor de áudio em background do YouTube ultra-leve e otimizado para o macOS (Apple Silicon M1/M2/M3), integrado diretamente na sua barra de menus usando o SwiftBar.
 
+![Demonstração da Barra de Menus](menu_bar.png)
+
 ---
 
 ## ✨ Características Principais
