@@ -1,0 +1,9 @@
+# macOS System Files
+.DS_Store
+
+# Local Player Cache & State Files
+.yt_audio_state.json
+
+# Python Compiler Cache Directories
+__pycache__/
+*.pyc
