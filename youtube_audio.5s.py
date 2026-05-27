@@ -143,7 +143,7 @@ def is_mpv_running():
 
 # 5. Persistent Playlist Cache
 def save_current_playlist():
-    if not is_mpv_running():
+    if not os.path.exists(SOCKET_PATH):
         return
     res = send_mpv_command(["get_property", "playlist"])
     if res.get("error") == "success" and res.get("data"):
@@ -154,6 +154,17 @@ def save_current_playlist():
             if item.get("current"):
                 current_index = i
                 break
+        
+        # Avoid redundant disk writes if playlist & current index haven't changed
+        try:
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE, "r") as f:
+                    old_state = json.load(f)
+                if old_state.get("urls") == urls and old_state.get("current_index") == current_index:
+                    return
+        except Exception:
+            pass
+
         state = {
             "urls": urls,
             "current_index": current_index,
@@ -210,6 +221,8 @@ def start_mpv():
         f"--input-ipc-server={SOCKET_PATH}",
         "--idle=yes",
         "--loop-playlist=force",
+        # Force yt-dlp to parse and load full playlists when loading watch + playlist URLs
+        "--ytdl-raw-options=yes-playlist=",
         # Prioritize AAC (m4a) which uses Apple Silicon hardware audio decoders (extremely low CPU)
         "--ytdl-format=bestaudio[ext=m4a]/bestaudio",
         # Restrict the demuxer lookahead & back cache sizes to keep RAM footprint extremely tiny (~30MB)
@@ -344,6 +357,9 @@ def get_player_status():
     
     if title and title.startswith(("http://", "https://")):
         title = "A carregar stream do YouTube..."
+        
+    # Automatically update and save the persistent playlist state/index
+    save_current_playlist()
         
     return {
         "status": "paused" if is_paused else "playing",
