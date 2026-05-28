@@ -28,6 +28,7 @@ for path in ["/opt/homebrew/bin", "/usr/local/bin"]:
 SOCKET_PATH = "/tmp/yt-audio-player.sock"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, ".yt_audio_state.json")
+HISTORY_FILE = os.path.join(SCRIPT_DIR, ".yt_audio_history.json")
 IDLE_TITLE = "Em Espera (Sem faixa ativa)"
 
 # 2. Dependency Verification
@@ -141,6 +142,89 @@ def is_mpv_running():
     res = send_mpv_command(["get_property", "mpv-version"])
     return res.get("error") == "success"
 
+def resolve_missing_titles():
+    python_bin = sys.executable
+    script = f"""
+import subprocess, json, os, sys, time
+state_file = {repr(STATE_FILE)}
+history_file = {repr(HISTORY_FILE)}
+
+for path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+    if path not in os.environ["PATH"]:
+        os.environ["PATH"] = path + os.path.pathsep + os.environ["PATH"]
+
+try:
+    if not os.path.exists(state_file):
+        sys.exit(0)
+        
+    with open(state_file, "r") as f:
+        state = json.load(f)
+        
+    urls = state.get("urls", [])
+    cache = state.setdefault("titles_cache", {{}})
+    
+    missing_urls = [u for u in urls if u and u not in cache]
+    if not missing_urls:
+        sys.exit(0)
+        
+    # Resolve first 15 missing URLs in this background run to keep it fast
+    updated = False
+    for url in missing_urls[:15]:
+        title = None
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, "r") as f:
+                    history = json.load(f)
+                for item in history:
+                    if item.get("url") == url:
+                        t = item.get("title")
+                        if t and not t.startswith("http"):
+                            title = t
+                            break
+            except Exception:
+                pass
+                
+        if not title:
+            proc = subprocess.run(
+                ["yt-dlp", "--get-title", "--no-warnings", "--playlist-items", "1", url],
+                capture_output=True,
+                text=True,
+                timeout=8
+            )
+            if proc.returncode == 0:
+                title = proc.stdout.strip()
+                
+        if title:
+            try:
+                with open(state_file, "r") as f:
+                    curr_state = json.load(f)
+            except Exception:
+                curr_state = state
+            
+            curr_cache = curr_state.setdefault("titles_cache", {{}})
+            curr_cache[url] = title
+            state = curr_state
+            updated = True
+            
+            try:
+                with open(state_file, "w") as f:
+                    json.dump(state, f, indent=2)
+            except Exception:
+                pass
+                
+            time.sleep(0.5)
+except Exception:
+    pass
+"""
+    subprocess.Popen(
+        [python_bin, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+
 # 5. Persistent Playlist Cache
 def save_current_playlist():
     if not os.path.exists(SOCKET_PATH):
@@ -155,24 +239,39 @@ def save_current_playlist():
                 current_index = i
                 break
         
-        # Avoid redundant disk writes if playlist & current index haven't changed
-        try:
-            if os.path.exists(STATE_FILE):
+        # Load existing state to check changes and preserve cache
+        existing_state = {}
+        if os.path.exists(STATE_FILE):
+            try:
                 with open(STATE_FILE, "r") as f:
-                    old_state = json.load(f)
-                if old_state.get("urls") == urls and old_state.get("current_index") == current_index:
-                    return
-        except Exception:
-            pass
+                    existing_state = json.load(f)
+            except Exception:
+                pass
+                
+        # Avoid redundant disk writes if playlist & current index haven't changed
+        if existing_state.get("urls") == urls and existing_state.get("current_index") == current_index:
+            return
 
+        # Prepare new state preserving titles_cache
         state = {
             "urls": urls,
             "current_index": current_index,
-            "updated_at": time.time()
+            "updated_at": time.time(),
+            "titles_cache": existing_state.get("titles_cache", {})
         }
+        
+        # We can also harvest any newly resolved titles from the mpv playlist property!
+        titles_cache = state["titles_cache"]
+        for item in playlist:
+            f_name = item.get("filename")
+            t_title = item.get("title")
+            if f_name and t_title and not t_title.startswith("http"):
+                titles_cache[f_name] = t_title
+                
         try:
             with open(STATE_FILE, "w") as f:
                 json.dump(state, f, indent=2)
+            resolve_missing_titles()
         except Exception:
             pass
 
@@ -198,6 +297,192 @@ def load_saved_playlist():
             send_mpv_command(["set_property", "playlist-pos", current_index])
     except Exception:
         pass
+
+# 5b. Playback History Cache
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        pass
+
+def resolve_title_background(url):
+    python_bin = sys.executable
+    script = f"""
+import subprocess, json, os, sys
+url = {repr(url)}
+state_file = {repr(STATE_FILE)}
+history_file = {repr(HISTORY_FILE)}
+
+for path in ["/opt/homebrew/bin", "/usr/local/bin"]:
+    if path not in os.environ["PATH"]:
+        os.environ["PATH"] = path + os.path.pathsep + os.environ["PATH"]
+
+try:
+    title = None
+    entries_map = {{}}
+    
+    # 1. Check if it's a playlist URL
+    if "list=" in url or "playlist" in url:
+        proc_pl = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "-J", url],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if proc_pl.returncode == 0:
+            data = json.loads(proc_pl.stdout)
+            title = data.get("title")
+            for entry in data.get("entries", []):
+                e_url = entry.get("url") or (f"https://www.youtube.com/watch?v={{entry.get('id')}}" if entry.get("id") else None)
+                e_title = entry.get("title")
+                if e_url and e_title:
+                    entries_map[e_url] = e_title
+                    
+    # 2. If not a playlist, or if playlist title fetch failed, treat as single video
+    if not title:
+        proc = subprocess.run(
+            ["yt-dlp", "--get-title", "--no-warnings", "--playlist-items", "1", url],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if proc.returncode == 0:
+            title = proc.stdout.strip()
+            if title:
+                entries_map[url] = title
+
+    # 3. Update titles_cache in state_file
+    if entries_map or title:
+        state = {{}}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r") as f:
+                    state = json.load(f)
+            except Exception:
+                pass
+                
+        cache = state.setdefault("titles_cache", {{}})
+        updated = False
+        
+        # Add playlist/video title itself to cache
+        if title and url not in cache:
+            cache[url] = title
+            updated = True
+            
+        # Add all individual playlist entries to cache
+        for e_url, e_title in entries_map.items():
+            if cache.get(e_url) != e_title:
+                cache[e_url] = e_title
+                updated = True
+                
+        if updated:
+            try:
+                with open(state_file, "w") as f:
+                    json.dump(state, f, indent=2)
+            except Exception:
+                pass
+
+        # 4. Also update history file safely for any matching URLs
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, "r") as f:
+                    history = json.load(f)
+                h_updated = False
+                for item in history:
+                    item_url = item.get("url")
+                    if item_url == url and title and (item.get("title") == url or item.get("title", "").startswith("http")):
+                        item["title"] = title
+                        h_updated = True
+                    elif item_url in entries_map and (item.get("title") == item_url or item.get("title", "").startswith("http")):
+                        item["title"] = entries_map[item_url]
+                        h_updated = True
+                if h_updated:
+                    with open(history_file, "w") as f:
+                        json.dump(history, f, indent=2)
+            except Exception:
+                pass
+except Exception:
+    pass
+"""
+    subprocess.Popen(
+        [python_bin, "-c", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+def add_to_history(url, title=None):
+    if not url:
+        return
+    history = load_history()
+    url = url.strip()
+    
+    # Avoid adding internal or non-youtube paths
+    if not (url.startswith("http://") or url.startswith("https://") or "youtube.com" in url or "youtu.be" in url):
+        return
+        
+    # Check if the most recent item is already this URL
+    if history and history[0].get("url") == url:
+        # If the title is now resolved but was previously just the URL, update it
+        if title and not title.startswith("http") and (history[0].get("title") == url or history[0].get("title", "").startswith("http")):
+            history[0]["title"] = title
+            save_history(history)
+        return
+        
+    existing_item = None
+    for item in history:
+        if item.get("url") == url:
+            existing_item = item
+            break
+            
+    if existing_item:
+        history.remove(existing_item)
+        existing_item["timestamp"] = time.time()
+        if title and not title.startswith("http") and (existing_item.get("title") == url or existing_item.get("title", "").startswith("http")):
+            existing_item["title"] = title
+        history.insert(0, existing_item)
+    else:
+        if not title:
+            title = url
+        new_item = {
+            "url": url,
+            "title": title,
+            "timestamp": time.time()
+        }
+        history.insert(0, new_item)
+        
+    save_history(history[:50])
+    
+    if not title or title == url or title.startswith("http"):
+        resolve_title_background(url)
+
+def clear_history_command():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
+        show_notification("Histórico Limpo", "O histórico de reprodução foi apagado.")
+    except Exception as e:
+        show_notification("Erro", f"Não foi possível limpar o histórico: {e}")
+
+def remove_history_item(url):
+    try:
+        history = load_history()
+        new_history = [item for item in history if item.get("url") != url]
+        save_history(new_history)
+        show_notification("Item Removido", "O item foi removido do histórico.")
+    except Exception as e:
+        show_notification("Erro", f"Não foi possível remover o item: {e}")
 
 # 6. Core Controls
 def start_mpv():
@@ -261,6 +546,7 @@ def play_command(url=None):
         res = send_mpv_command(["loadfile", url, "replace"])
         time.sleep(0.2)
         save_current_playlist()
+        add_to_history(url)
         return res.get("error") == "success"
 
 def pause_command():
@@ -314,6 +600,7 @@ def add_url(url):
     res = send_mpv_command(["loadfile", url, "append-play"])
     time.sleep(0.25)
     save_current_playlist()
+    add_to_history(url)
     return res.get("error") == "success"
 
 def select_track(index):
@@ -339,6 +626,53 @@ def format_time(seconds):
     else:
         return f"{minutes:02d}:{secs:02d}"
 
+def update_title_cache(url, title):
+    if not url or not title or title.startswith(("http://", "https://", "A carregar stream")):
+        return
+    try:
+        state = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+        
+        cache = state.setdefault("titles_cache", {})
+        if cache.get(url) != title:
+            cache[url] = title
+            with open(STATE_FILE, "w") as f:
+                json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+def get_cached_title(url, mpv_title=None):
+    if mpv_title and not mpv_title.startswith(("http://", "https://", "A carregar stream")):
+        # Update cache with recently resolved mpv title
+        update_title_cache(url, mpv_title)
+        return mpv_title
+        
+    # Check STATE_FILE cache
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+            cache = state.get("titles_cache", {})
+            if url in cache:
+                title = cache[url]
+                if title and not title.startswith(("http://", "https://", "A carregar stream")):
+                    return title
+        except Exception:
+            pass
+            
+    # Check history file
+    history = load_history()
+    for item in history:
+        if item.get("url") == url:
+            title = item.get("title")
+            if title and not title.startswith(("http://", "https://", "A carregar stream")):
+                update_title_cache(url, title)
+                return title
+                
+    return None
+
 def get_player_status():
     if not is_mpv_running():
         return {"status": "stopped", "paused": True, "muted": False, "title": "", "time_pos": 0.0, "duration": 0.0}
@@ -355,11 +689,49 @@ def get_player_status():
     time_pos = time_res.get("data", 0.0) if time_res.get("error") == "success" else 0.0
     duration = duration_res.get("data", 0.0) if duration_res.get("error") == "success" else 0.0
     
-    if title and title.startswith(("http://", "https://")):
+    # Try resolving friendly title
+    path_res = send_mpv_command(["get_property", "path"])
+    current_path = path_res.get("data") if path_res.get("error") == "success" else None
+    
+    friendly_title = None
+    if current_path:
+        friendly_title = get_cached_title(current_path, title)
+        
+    if friendly_title:
+        title = friendly_title
+    elif title and title.startswith(("http://", "https://")):
         title = "A carregar stream do YouTube..."
         
     # Automatically update and save the persistent playlist state/index
     save_current_playlist()
+    
+    # Automatically log the currently playing track to the history
+    try:
+        if current_path:
+            friendly_title = title if (title and not title.startswith(("http://", "https://", "A carregar stream"))) else None
+            add_to_history(current_path, friendly_title)
+    except Exception:
+        pass
+    
+    # Update history entry titles from the playing/playlist files if they resolve
+    try:
+        playlist_res = send_mpv_command(["get_property", "playlist"])
+        if playlist_res.get("error") == "success" and playlist_res.get("data"):
+            playlist = playlist_res.get("data")
+            history = load_history()
+            history_updated = False
+            for item in playlist:
+                filename = item.get("filename")
+                t = item.get("title")
+                if filename and t and not t.startswith("http"):
+                    for h_item in history:
+                        if h_item.get("url") == filename and (h_item.get("title") == filename or h_item.get("title", "").startswith("http")):
+                            h_item["title"] = t
+                            history_updated = True
+            if history_updated:
+                save_history(history)
+    except Exception:
+        pass
         
     return {
         "status": "paused" if is_paused else "playing",
@@ -476,9 +848,18 @@ def draw_tui():
         if playlist_res.get("error") == "success" and playlist_res.get("data"):
             playlist = playlist_res.get("data")
             for i, item in enumerate(playlist[:5]):
-                t = item.get("title", item.get("filename", "Sem título"))
+                filename = item.get("filename")
+                t = item.get("title")
+                
+                cached_t = get_cached_title(filename, t)
+                if cached_t:
+                    t = cached_t
+                elif not t or t.startswith("http"):
+                    t = filename or "Sem título"
+                    
                 if t.startswith("http"):
                     t = "A carregar stream do YouTube..."
+                    
                 if len(t) > 48:
                     t = t[:45] + "..."
                 marker = "👉" if item.get("current") else "  "
@@ -673,6 +1054,52 @@ def run_swiftbar():
         print("▶️ Iniciar Player (Idle) | bash={script_path} param1=play terminal=false refresh=true")
         
     print("---")
+
+    # Display Playback History in a beautiful submenu
+    history = load_history()
+    print("📜 Histórico de Reprodução | color=#FFCC00")
+    if history:
+        playlists = []
+        songs = []
+        for item in history:
+            h_url = item.get("url")
+            if "list=" in h_url or "playlist" in h_url:
+                playlists.append(item)
+            else:
+                songs.append(item)
+                
+        # 1. Playlists
+        if playlists:
+            print("-- 📁 Playlists Recentes: | color=#888888")
+            for item in playlists[:10]: # Show top 10 recent playlists
+                h_url = item.get("url")
+                h_title = item.get("title", h_url)
+                if len(h_title) > 40:
+                    h_title = h_title[:37] + "..."
+                print(f"--   • {h_title} | bash={script_path} param1=play param2={h_url} terminal=false refresh=true")
+                print(f"--   • ❌ Remover: {h_title} | bash={script_path} param1=remove-history-item param2={h_url} terminal=false refresh=true alternate=true")
+                
+        # Separator if both exist
+        if playlists and songs:
+            print("-- ---")
+            
+        # 2. Songs
+        if songs:
+            print("-- 🎵 Músicas Recentes: | color=#888888")
+            for item in songs[:15]: # Show top 15 recent songs
+                h_url = item.get("url")
+                h_title = item.get("title", h_url)
+                if len(h_title) > 40:
+                    h_title = h_title[:37] + "..."
+                print(f"--   • {h_title} | bash={script_path} param1=play param2={h_url} terminal=false refresh=true")
+                print(f"--   • ❌ Remover: {h_title} | bash={script_path} param1=remove-history-item param2={h_url} terminal=false refresh=true alternate=true")
+            
+        print("-- ---")
+        print(f"-- 🧹 Limpar Histórico | bash={script_path} param1=clear-history terminal=false refresh=true")
+    else:
+        print("-- 🚫 Nenhum item recente | color=#888888")
+
+    print("---")
     
     # Adding options
     print(f"📋 Adicionar URL do Clipboard | bash={script_path} param1=add-clipboard terminal=false refresh=true")
@@ -684,9 +1111,18 @@ def run_swiftbar():
         print("---")
         print("Fila de Reprodução (Queue): | color=#888888")
         for i, item in enumerate(playlist):
-            t = item.get("title", item.get("filename", "Sem título"))
+            filename = item.get("filename")
+            t = item.get("title")
+            
+            cached_t = get_cached_title(filename, t)
+            if cached_t:
+                t = cached_t
+            elif not t or t.startswith("http"):
+                t = filename or "Sem título"
+                
             if t.startswith("http"):
                 t = "⏳ A carregar stream..."
+                
             if len(t) > 35:
                 t = t[:32] + "..."
             bullet = "👉" if item.get("current") else "•"
@@ -718,6 +1154,11 @@ def main():
             prev_command()
         elif cmd == "clear":
             clear_command()
+        elif cmd == "clear-history":
+            clear_history_command()
+        elif cmd == "remove-history-item":
+            if len(sys.argv) > 2:
+                remove_history_item(sys.argv[2])
         elif cmd == "add":
             if len(sys.argv) > 2:
                 add_url(sys.argv[2])
@@ -734,7 +1175,7 @@ def main():
             run_swiftbar()
         else:
             print(f"Comando '{cmd}' desconhecido.")
-            print("Comandos suportados: play, pause, toggle, mute, stop, next, prev, clear, add, add-clipboard, add-gui, select-track, install-deps, swiftbar")
+            print("Comandos suportados: play, pause, toggle, mute, stop, next, prev, clear, clear-history, remove-history-item, add, add-clipboard, add-gui, select-track, install-deps, swiftbar")
     else:
         # Standard fallback: detect TTY for TUI, else output SwiftBar
         if sys.stdin.isatty():
