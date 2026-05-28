@@ -467,11 +467,32 @@ def add_to_history(url, title=None):
     if not title or title == url or title.startswith("http"):
         resolve_title_background(url)
 
-def clear_history_command():
+def clear_history_command(target=None):
     try:
-        if os.path.exists(HISTORY_FILE):
+        if not os.path.exists(HISTORY_FILE):
+            show_notification("Histórico Limpo", "O histórico de reprodução já está vazio.")
+            return
+            
+        if target is None:
             os.remove(HISTORY_FILE)
-        show_notification("Histórico Limpo", "O histórico de reprodução foi apagado.")
+            show_notification("Histórico Limpo", "O histórico completo foi apagado.")
+            return
+            
+        history = load_history()
+        new_history = []
+        for item in history:
+            h_url = item.get("url", "")
+            is_playlist = "list=" in h_url or "playlist" in h_url
+            if target == "songs" and is_playlist:
+                new_history.append(item)
+            elif target == "playlists" and not is_playlist:
+                new_history.append(item)
+                
+        save_history(new_history)
+        if target == "songs":
+            show_notification("Músicas Limpas", "O histórico de músicas foi apagado.")
+        else:
+            show_notification("Playlists Limpas", "O histórico de playlists foi apagado.")
     except Exception as e:
         show_notification("Erro", f"Não foi possível limpar o histórico: {e}")
 
@@ -1095,7 +1116,9 @@ def run_swiftbar():
                 print(f"--   • ❌ Remover: {h_title} | bash={script_path} param1=remove-history-item param2={h_url} terminal=false refresh=true alternate=true")
             
         print("-- ---")
-        print(f"-- 🧹 Limpar Histórico | bash={script_path} param1=clear-history terminal=false refresh=true")
+        print(f"-- 🧹 Limpar Músicas Recentes | bash={script_path} param1=clear-history param2=songs terminal=false refresh=true")
+        print(f"-- 🧹 Limpar Playlists Recentes | bash={script_path} param1=clear-history param2=playlists terminal=false refresh=true")
+        print(f"-- 🧹 Limpar Todo o Histórico | bash={script_path} param1=clear-history terminal=false refresh=true")
     else:
         print("-- 🚫 Nenhum item recente | color=#888888")
 
@@ -1155,7 +1178,8 @@ def main():
         elif cmd == "clear":
             clear_command()
         elif cmd == "clear-history":
-            clear_history_command()
+            target = sys.argv[2] if len(sys.argv) > 2 else None
+            clear_history_command(target)
         elif cmd == "remove-history-item":
             if len(sys.argv) > 2:
                 remove_history_item(sys.argv[2])
